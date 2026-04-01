@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black"/>
+<title>Card Vault</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#fff;font-family:'Inter',sans-serif;max-width:480px;margin:0 auto;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+input,select,textarea,button{font-family:inherit}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:2px}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-8px)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+const KEY = 'cardvault-v1';
+
+async function ai(body) {
+  const r = await fetch('/api/claude', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return d.content?.map(b => b.text||'').join('').trim() || '';
+}
+
+function readImg(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const img = new Image();
+      img.onload = () => {
+        const MAX = 800;
+        let w = img.width, h = img.height;
+        const s = Math.min(MAX/w, MAX/h, 1);
+        w = Math.round(w*s); h = Math.round(h*s);
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(c.toDataURL('image/jpeg', 0.8));
+      };
+      img.onerror = () => resolve(e.target.result);
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error('Read failed'));
+    reader.readAsDataURL(file);
+  });
+}
+
+const s = (obj) => Object.entries(obj).map(([k,v]) => `${k}:${v}`).join(';');
+
+function CardForm({onAdd, onClose, prefill}) {
+  const conds = ['Poor','Good','Very Good','Excellent','Near Mint','Mint','Gem Mint'];
+  const [f, setF] = useState({
+    player:prefill?.player||'', team:prefill?.team||'', year:prefill?.year||'',
+    set:prefill?.set||'', condition:prefill?.condition||'Near Mint',
+    cardNumber:prefill?.cardNumber||'', parallel:prefill?.parallel||'',
+    rookie:prefill?.rookie||false, sport:prefill?.sport||'',
+    buyPrice:prefill?.buyPrice||'', quantity:1, notes:prefill?.notes||'', photo:null
+  });
+  const [scanMsg, setScanMsg] = useState('');
+  const [scanning, setScanning] = useState(false);
+
+  const handlePhoto = async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setScanMsg('Loading photo...');
+    try {
+      const url = await readImg(file);
+      setF(p => ({...p, photo:url}));
+      setScanMsg('Photo ready — tap Scan to auto-fill.');
+    } catch { setScanMsg('Could not load photo.'); }
+  };
+
+  const scan = async () => {
+    if (!f.photo) return;
+    setScanning(true); setScanMsg('Reading card...');
+    try {
+      const base64 = f.photo.split(',')[1];
+      const text = await ai({
+        model:'claude-sonnet-4-5', max_tokens:500,
+        messages:[{role:'user', content:[
+          {type:'image', source:{type:'base64', media_type:'image/jpeg', data:base64}},
+          {type:'text', text:'Analyze this sports card. Return ONLY raw JSON:\n{"player":"","team":"","year":"","set":"","sport":"","cardNumber":"","parallel":"","rookie":false,"condition":"Near Mint","notes":""}'}
+        ]}]
+      });
+      const clean = text.replace(/^```(?:json)?\s*/i,'').replace(/\s*```\s*$/i,'').trim();
+      let r;
+      try { r = JSON.parse(clean); } catch { const m = clean.match(/\{[\s\S]*\}/); r = m ? JSON.parse(m[0]) : {}; }
+      setF(p => ({...p,
+        player:r.player||p.player, team:r.team||p.team, year:r.year||p.year,
+        set:r.set||p.set, condition:r.condition||p.condition,
+        cardNumber:r.cardNumber||p.cardNumber, parallel:r.parallel||p.parallel,
+        rookie:r.rookie??p.rookie, sport:r.sport||p.sport, notes:r.notes||p.notes
+      }));
+      setScanMsg('✓ Done! Review fields below.');
+    } catch(e) { setScanMsg('Scan error: '+e.message); }
+    setScanning(false);
+  };
+
+  const inp = (label, key, placeholder, type='text') => (
+    <div style={{marginBottom:'0.85rem'}}>
+      <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.3rem',textTransform:'uppercase'}}>{label}</label>
+      <input type={type} value={f[key]} onChange={e=>setF({...f,[key]:e.target.value})} placeholder={placeholder}
+        style={{width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem 0.9rem',color:'#fff',fontSize:'0.88rem',outline:'none',boxSizing:'border-box'}}
+        onFocus={e=>e.target.style.borderColor='#e8c84a'} onBlur={e=>e.target.style.borderColor='#2a2a4a'}/>
+    </div>
+  );
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.92)',zIndex:150,display:'flex',alignItems:'flex-start',justifyContent:'center',padding:'1rem',overflowY:'auto'}}>
+      <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:'1px solid #e8c84a33',borderRadius:'16px',padding:'1.5rem',width:'100%',maxWidth:'480px',marginBottom:'1rem'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1.25rem'}}>
+          <h2 style={{color:'#e8c84a',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.6rem',letterSpacing:'2px',margin:0}}>ADD CARD</h2>
+          <button onClick={onClose} style={{background:'none',border:'none',color:'#666',fontSize:'2rem',cursor:'pointer',lineHeight:1,padding:0}}>&times;</button>
+        </div>
+
+        <div style={{marginBottom:'1.25rem'}}>
+          <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.5rem',textTransform:'uppercase'}}>Photo & Auto-Scan</label>
+          {f.photo && <div style={{width:'100%',height:'120px',borderRadius:'10px',overflow:'hidden',marginBottom:'0.6rem',border:'1px solid #e8c84a33',background:'#0a0a12'}}>
+            <img src={f.photo} style={{width:'100%',height:'100%',objectFit:'contain'}}/>
+          </div>}
+          <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.5rem'}}>
+            <label style={{flex:1,display:'block',background:'linear-gradient(135deg,#e8c84a,#d4a017)',borderRadius:'8px',padding:'0.65rem',textAlign:'center',cursor:'pointer',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.85rem',letterSpacing:'1.5px',color:'#0d1117',position:'relative',userSelect:'none'}}>
+              📷 CAMERA
+              <input type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{position:'absolute',inset:0,opacity:0,width:'100%',height:'100%',cursor:'pointer'}}/>
+            </label>
+            <label style={{flex:1,display:'block',background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.65rem',textAlign:'center',cursor:'pointer',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.85rem',letterSpacing:'1.5px',color:'#888',position:'relative',userSelect:'none'}}>
+              🖼 LIBRARY
+              <input type="file" accept="image/*" onChange={handlePhoto} style={{position:'absolute',inset:0,opacity:0,width:'100%',height:'100%',cursor:'pointer'}}/>
+            </label>
+          </div>
+          {f.photo && <button onClick={scan} disabled={scanning} style={{width:'100%',background:scanning?'#2a2a4a':'linear-gradient(135deg,#6366f1,#4f46e5)',border:'none',borderRadius:'8px',padding:'0.65rem',color:'#fff',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.88rem',letterSpacing:'2px',cursor:scanning?'default':'pointer'}}>
+            {scanning?'SCANNING...':'✨ SCAN CARD — AUTO-FILL'}
+          </button>}
+          {scanMsg && <div style={{marginTop:'0.5rem',fontSize:'0.75rem',color:scanMsg.startsWith('✓')?'#4ade80':scanMsg.includes('error')?'#f87171':'#e8c84a',lineHeight:'1.4'}}>{scanMsg}</div>}
+        </div>
+
+        <div style={{display:'flex',alignItems:'center',gap:'0.75rem',marginBottom:'1rem'}}>
+          <button onClick={()=>setF({...f,rookie:!f.rookie})} style={{background:f.rookie?'#e8c84a':'#1a1a2e',border:`1px solid ${f.rookie?'#e8c84a':'#2a2a4a'}`,borderRadius:'6px',padding:'0.3rem 0.85rem',color:f.rookie?'#0d1117':'#666',fontSize:'0.68rem',letterSpacing:'1px',cursor:'pointer',fontWeight:'700',textTransform:'uppercase'}}>🏆 Rookie Card</button>
+          {f.rookie && <span style={{color:'#e8c84a',fontSize:'0.72rem'}}>RC ✓</span>}
+        </div>
+
+        {inp('Player Name *','player','e.g. LeBron James')}
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.75rem'}}>
+          <div>{inp('Team','team','e.g. Lakers')}</div>
+          <div>{inp('Year','year','e.g. 2024')}</div>
+        </div>
+        {inp('Card Set / Brand','set','e.g. Panini Phoenix')}
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.75rem'}}>
+          <div>{inp('Card #','cardNumber','#128')}</div>
+          <div>{inp('Parallel','parallel','e.g. Silver')}</div>
+        </div>
+        {inp('Sport','sport','e.g. Football')}
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.75rem',marginBottom:'0.85rem'}}>
+          <div>
+            <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.3rem',textTransform:'uppercase'}}>Condition</label>
+            <select value={f.condition} onChange={e=>setF({...f,condition:e.target.value})} style={{width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem 0.75rem',color:'#fff',fontSize:'0.88rem',outline:'none'}}>
+              {conds.map(c=><option key={c}>{c}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.3rem',textTransform:'uppercase'}}>Qty</label>
+            <input type="number" min="1" value={f.quantity} onChange={e=>setF({...f,quantity:parseInt(e.target.value)||1})} style={{width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem 0.9rem',color:'#fff',fontSize:'0.88rem',outline:'none',boxSizing:'border-box'}}/>
+          </div>
+        </div>
+        <div style={{marginBottom:'0.85rem'}}>
+          <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.3rem',textTransform:'uppercase'}}>Buy Price ($)</label>
+          <input type="number" step="0.01" value={f.buyPrice} onChange={e=>setF({...f,buyPrice:e.target.value})} placeholder="0.00" style={{width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem 0.9rem',color:'#fff',fontSize:'0.88rem',outline:'none',boxSizing:'border-box'}} onFocus={e=>e.target.style.borderColor='#e8c84a'} onBlur={e=>e.target.style.borderColor='#2a2a4a'}/>
+        </div>
+        <div style={{marginBottom:'1.25rem'}}>
+          <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.3rem',textTransform:'uppercase'}}>Notes</label>
+          <textarea value={f.notes} onChange={e=>setF({...f,notes:e.target.value})} placeholder="autograph, serial number, etc." rows={2} style={{width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem 0.9rem',color:'#fff',fontSize:'0.88rem',outline:'none',boxSizing:'border-box',resize:'vertical'}}/>
+        </div>
+        <button onClick={()=>{
+          if(!f.player) return;
+          onAdd({...f,id:Date.now(),buyPrice:parseFloat(f.buyPrice)||0,addedAt:new Date().toISOString(),sold:false,sellPrice:null,sellDate:null});
+          onClose();
+        }} style={{width:'100%',background:'linear-gradient(135deg,#e8c84a,#d4a017)',border:'none',borderRadius:'10px',padding:'0.9rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.1rem',letterSpacing:'2px',cursor:'pointer'}}>
+          ADD TO COLLECTION
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SellModal({card, onSell, onClose}) {
+  const [price, setPrice] = useState('');
+  const profit = price ? parseFloat(price) - card.buyPrice : null;
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',zIndex:100,display:'flex',alignItems:'center',justifyContent:'center',padding:'1rem'}}>
+      <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:'1px solid #4ade8033',borderRadius:'16px',padding:'2rem',width:'100%',maxWidth:'380px'}}>
+        <h2 style={{color:'#4ade80',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.6rem',letterSpacing:'2px',margin:'0 0 0.5rem'}}>LOG SALE</h2>
+        <p style={{color:'#aaa',fontSize:'0.9rem',margin:'0 0 0.5rem'}}>{card.year} {card.player} — {card.set}</p>
+        <p style={{color:'#666',fontSize:'0.85rem',margin:'0 0 1.25rem'}}>Paid: <span style={{color:'#fff'}}>${card.buyPrice.toFixed(2)}</span></p>
+        <label style={{display:'block',color:'#aaa',fontSize:'0.7rem',letterSpacing:'1.5px',marginBottom:'0.4rem',textTransform:'uppercase'}}>Sell Price ($)</label>
+        <input type="number" step="0.01" value={price} onChange={e=>setPrice(e.target.value)} placeholder="0.00" style={{width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.7rem 1rem',color:'#fff',fontSize:'0.95rem',outline:'none',boxSizing:'border-box',marginBottom:'1rem'}}/>
+        {profit!==null && <div style={{background:profit>=0?'#4ade8011':'#f8717111',border:`1px solid ${profit>=0?'#4ade8033':'#f8717133'}`,borderRadius:'8px',padding:'0.65rem 1rem',marginBottom:'1.25rem'}}>
+          <span style={{color:profit>=0?'#4ade80':'#f87171',fontWeight:'bold'}}>{profit>=0?'▲ Profit':'▼ Loss'}: ${Math.abs(profit).toFixed(2)}</span>
+        </div>}
+        <div style={{display:'flex',gap:'0.75rem'}}>
+          <button onClick={onClose} style={{flex:1,background:'transparent',border:'1px solid #333',borderRadius:'8px',padding:'0.75rem',color:'#aaa',cursor:'pointer'}}>Cancel</button>
+          <button onClick={()=>{if(price){onSell(card.id,parseFloat(price));onClose();}}} style={{flex:2,background:'linear-gradient(135deg,#4ade80,#22c55e)',border:'none',borderRadius:'8px',padding:'0.75rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'1rem',letterSpacing:'2px',cursor:'pointer'}}>CONFIRM SALE</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentChat({cards, priceCard, onClearPrice}) {
+  const makeQ = c => `What should I sell my ${[c.year,c.player,c.parallel,c.set].filter(Boolean).join(' ')} for? Condition: ${c.condition}. I paid $${c.buyPrice.toFixed(2)}.`;
+  const [msgs, setMsgs] = useState([{role:'assistant',text:"Hi! I know your full collection. Ask me what any card is worth, whether to buy or sell, or anything about the market."}]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const bottomRef = useRef(null);
+
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[msgs]);
+
+  useEffect(()=>{
+    if(priceCard){ const q=makeQ(priceCard); onClearPrice(); doSend(q,msgs); }
+  },[priceCard]);
+
+  const summary = cards.filter(c=>!c.sold).map(c=>
+    `${c.year||'?'} ${c.player}${c.rookie?' [RC]':''}${c.parallel?' '+c.parallel:''} - ${c.set||'?'}, ${c.condition}, paid $${c.buyPrice.toFixed(2)}`
+  ).join('\n')||'No cards yet.';
+
+  const doSend = async (text, currentMsgs) => {
+    const msg = text||input.trim();
+    if(!msg||loading) return;
+    setInput('');
+    const base = currentMsgs||msgs;
+    const next = [...base,{role:'user',text:msg}];
+    setMsgs(next);
+    setLoading(true);
+    try {
+      const reply = await ai({
+        model:'claude-sonnet-4-5', max_tokens:1000,
+        system:`You are a sports card market expert. Collection:\n${summary}\n\nGive specific price ranges. Recommend checking eBay sold listings. Be concise.`,
+        messages:next.filter(m=>m.role==='user'||m.role==='assistant').slice(-10).map(m=>({role:m.role,content:m.text}))
+      });
+      setMsgs(p=>[...p,{role:'assistant',text:reply}]);
+    } catch(e) { setMsgs(p=>[...p,{role:'assistant',text:'Error: '+e.message}]); }
+    setLoading(false);
+  };
+
+  const quickPrompts = ["What's my most valuable card?","What should I sell now?","What's hot in the market?"];
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100%',background:'#0d1117'}}>
+      <div style={{flex:1,overflowY:'auto',padding:'1rem',display:'flex',flexDirection:'column',gap:'0.75rem'}}>
+        {msgs.map((m,i)=>(
+          <div key={i} style={{display:'flex',justifyContent:m.role==='user'?'flex-end':'flex-start'}}>
+            <div style={{maxWidth:'85%',padding:'0.75rem 1rem',borderRadius:m.role==='user'?'16px 16px 4px 16px':'16px 16px 16px 4px',background:m.role==='user'?'linear-gradient(135deg,#6366f1,#4f46e5)':'#1a1a2e',border:m.role==='assistant'?'1px solid #6366f122':'none',color:'#e2e8f0',fontSize:'0.88rem',lineHeight:'1.6',whiteSpace:'pre-wrap'}}>{m.text}</div>
+          </div>
+        ))}
+        {loading && <div style={{display:'flex',gap:'0.4rem',padding:'0.25rem'}}>
+          {[0,1,2].map(i=><div key={i} style={{width:'8px',height:'8px',borderRadius:'50%',background:'#6366f1',animation:`bounce 1.2s ease-in-out ${i*0.2}s infinite`}}/>)}
+        </div>}
+        <div ref={bottomRef}/>
+      </div>
+      <div style={{padding:'0.5rem 1rem 0',display:'flex',gap:'0.4rem',flexWrap:'wrap'}}>
+        {quickPrompts.map(q=>(
+          <button key={q} onClick={()=>doSend(q)} disabled={loading} style={{background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'20px',padding:'0.3rem 0.75rem',color:'#666',fontSize:'0.7rem',cursor:'pointer'}}>{q}</button>
+        ))}
+      </div>
+      <div style={{padding:'0.75rem 1rem 1rem',borderTop:'1px solid #1a1a2e',display:'flex',gap:'0.5rem',marginTop:'0.5rem'}}>
+        <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&doSend()} placeholder="Ask about prices, buy/sell advice..." style={{flex:1,background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'24px',padding:'0.7rem 1.2rem',color:'#fff',fontSize:'0.88rem',outline:'none'}}/>
+        <button onClick={()=>doSend()} disabled={loading} style={{background:'linear-gradient(135deg,#6366f1,#4f46e5)',border:'none',borderRadius:'50%',width:'44px',height:'44px',cursor:'pointer',color:'#fff',fontSize:'1.1rem',flexShrink:0}}>→</button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [cards, setCards] = useState(()=>{ try{return JSON.parse(localStorage.getItem(KEY)||'[]');}catch{return [];} });
+  const [tab, setTab] = useState('collection');
+  const [showForm, setShowForm] = useState(false);
+  const [prefill, setPrefill] = useState(null);
+  const [sellCard, setSellCard] = useState(null);
+  const [priceCard, setPriceCard] = useState(null);
+  const [filter, setFilter] = useState('all');
+
+  useEffect(()=>{ try{localStorage.setItem(KEY,JSON.stringify(cards));}catch{} },[cards]);
+
+  const addCard = c => setCards(p=>[...p,c]);
+  const logSale = (id,price) => setCards(p=>p.map(c=>c.id===id?{...c,sold:true,sellPrice:price,sellDate:new Date().toISOString()}:c));
+  const deleteCard = id => setCards(p=>p.filter(c=>c.id!==id));
+
+  const active = cards.filter(c=>!c.sold);
+  const sold = cards.filter(c=>c.sold);
+  const invested = active.reduce((s,c)=>s+c.buyPrice*c.quantity,0);
+  const pl = sold.reduce((s,c)=>s+(c.sellPrice-c.buyPrice)*c.quantity,0);
+  const display = filter==='sold'?sold:filter==='active'?active:cards;
+
+  const Stat = ({label,value,color}) => (
+    <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${color}22`,borderRadius:'12px',padding:'1rem',flex:1,minWidth:0}}>
+      <div style={{color:'#555',fontSize:'0.63rem',letterSpacing:'1.5px',textTransform:'uppercase',marginBottom:'0.2rem'}}>{label}</div>
+      <div style={{color,fontFamily:'Bebas Neue,sans-serif',fontSize:'1.35rem',letterSpacing:'1px'}}>{value}</div>
+    </div>
+  );
+
+  const tabBtn = (id,label) => (
+    <button onClick={()=>setTab(id)} style={{flex:1,background:'none',border:'none',borderBottom:`2px solid ${tab===id?'#e8c84a':'transparent'}`,color:tab===id?'#e8c84a':'#555',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.83rem',letterSpacing:'1.5px',padding:'0.6rem 0',cursor:'pointer'}}>{label}</button>
+  );
+
+  const filterBtn = (f,label) => (
+    <button onClick={()=>setFilter(f)} style={{background:filter===f?'#e8c84a':'#1a1a2e',color:filter===f?'#0d1117':'#555',border:`1px solid ${filter===f?'#e8c84a':'#2a2a4a'}`,borderRadius:'20px',padding:'0.3rem 0.9rem',fontSize:'0.72rem',letterSpacing:'1px',cursor:'pointer',textTransform:'uppercase',fontWeight:'600'}}>{label}</button>
+  );
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100vh',background:'#0d1117'}}>
+      <div style={{background:'linear-gradient(135deg,#1a1a2e,#16213e)',borderBottom:'1px solid #e8c84a22',padding:'1.25rem 1rem 0',flexShrink:0}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'1rem'}}>
+          <div>
+            <h1 style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'2rem',letterSpacing:'3px',color:'#e8c84a',margin:0,lineHeight:1}}>CARD VAULT</h1>
+            <p style={{color:'#444',fontSize:'0.68rem',margin:'0.2rem 0 0',letterSpacing:'1px'}}>SPORTS CARD MANAGER</p>
+          </div>
+          {tab==='collection' && <button onClick={()=>{setPrefill(null);setShowForm(true);}} style={{background:'linear-gradient(135deg,#e8c84a,#d4a017)',border:'none',borderRadius:'10px',padding:'0.55rem 1.1rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.95rem',letterSpacing:'1.5px',cursor:'pointer'}}>+ ADD</button>}
+        </div>
+        <div style={{display:'flex'}}>{tabBtn('collection','COLLECTION')}{tabBtn('agent','AI AGENT')}{tabBtn('stats','STATS')}</div>
+      </div>
+
+      <div style={{flex:1,overflow:'hidden',display:'flex',flexDirection:'column'}}>
+        {tab==='collection' && (
+          <div style={{flex:1,overflowY:'auto'}}>
+            <div style={{display:'flex',gap:'0.5rem',padding:'0.75rem 1rem'}}>
+              {filterBtn('all','All')}{filterBtn('active','Active')}{filterBtn('sold','Sold')}
+            </div>
+            {display.length===0 ? (
+              <div style={{textAlign:'center',padding:'3rem 1rem',color:'#444'}}>
+                <div style={{fontSize:'3rem',marginBottom:'1rem'}}>🃏</div>
+                <div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'1.2rem',letterSpacing:'2px'}}>NO CARDS YET</div>
+                <div style={{fontSize:'0.82rem',marginTop:'0.5rem'}}>Tap + ADD to get started</div>
+              </div>
+            ) : (
+              <div style={{padding:'0 1rem 1rem',display:'flex',flexDirection:'column',gap:'0.75rem'}}>
+                {display.map(card=>(
+                  <div key={card.id} style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${card.sold?'#4ade8022':'#e8c84a22'}`,borderRadius:'14px',overflow:'hidden',position:'relative'}}>
+                    {card.photo && <div style={{width:'100%',height:'95px',background:'#0a0a12'}}><img src={card.photo} alt={card.player} style={{width:'100%',height:'100%',objectFit:'contain'}}/></div>}
+                    <div style={{padding:'0.85rem'}}>
+                      {card.sold && <div style={{position:'absolute',top:card.photo?'80px':'10px',right:'-18px',background:'#4ade80',color:'#0d1117',fontSize:'0.55rem',fontWeight:'800',padding:'0.2rem 1.5rem',transform:'rotate(45deg)',letterSpacing:'1px'}}>SOLD</div>}
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:'flex',alignItems:'center',gap:'0.4rem',marginBottom:'0.15rem'}}>
+                            <div style={{fontWeight:'600',fontSize:'0.97rem',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{card.player}</div>
+                            {card.rookie && <span style={{background:'#e8c84a',color:'#0d1117',fontSize:'0.52rem',fontWeight:'800',padding:'0.08rem 0.35rem',borderRadius:'3px',flexShrink:0}}>RC</span>}
+                          </div>
+                          <div style={{color:'#666',fontSize:'0.76rem'}}>{[card.year,card.team,card.set].filter(Boolean).join(' · ')}</div>
+                          <div style={{marginTop:'0.45rem',display:'flex',gap:'0.35rem',flexWrap:'wrap'}}>
+                            <span style={{background:'#0d1117',border:'1px solid #1e1e3a',borderRadius:'4px',padding:'0.08rem 0.4rem',fontSize:'0.62rem',color:'#888'}}>{card.condition}</span>
+                            {card.parallel && <span style={{background:'#0d1117',border:'1px solid #e8c84a33',borderRadius:'4px',padding:'0.08rem 0.4rem',fontSize:'0.62rem',color:'#e8c84a'}}>{card.parallel}</span>}
+                            {card.quantity>1 && <span style={{background:'#0d1117',border:'1px solid #1e1e3a',borderRadius:'4px',padding:'0.08rem 0.4rem',fontSize:'0.62rem',color:'#888'}}>×{card.quantity}</span>}
+                          </div>
+                        </div>
+                        <div style={{textAlign:'right',minWidth:'70px',paddingLeft:'0.5rem'}}>
+                          <div style={{color:'#444',fontSize:'0.58rem',textTransform:'uppercase',letterSpacing:'1px'}}>Paid</div>
+                          <div style={{color:'#e8c84a',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.15rem'}}>${card.buyPrice.toFixed(2)}</div>
+                          {card.sold && <>
+                            <div style={{color:'#444',fontSize:'0.58rem',textTransform:'uppercase',letterSpacing:'1px',marginTop:'0.2rem'}}>Sold</div>
+                            <div style={{color:card.sellPrice>=card.buyPrice?'#4ade80':'#f87171',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.15rem'}}>${card.sellPrice?.toFixed(2)}</div>
+                          </>}
+                        </div>
+                      </div>
+                      <div style={{display:'flex',gap:'0.5rem',marginTop:'0.7rem'}}>
+                        {!card.sold && <button onClick={()=>setSellCard(card)} style={{flex:1,background:'#4ade8011',border:'1px solid #4ade8033',borderRadius:'8px',padding:'0.42rem',color:'#4ade80',fontSize:'0.7rem',letterSpacing:'1px',cursor:'pointer',fontWeight:'600',textTransform:'uppercase'}}>Log Sale</button>}
+                        <button onClick={()=>{setPriceCard(card);setTab('agent');}} style={{flex:1,background:'#6366f111',border:'1px solid #6366f133',borderRadius:'8px',padding:'0.42rem',color:'#818cf8',fontSize:'0.7rem',letterSpacing:'1px',cursor:'pointer',fontWeight:'600',textTransform:'uppercase'}}>💬 Price</button>
+                        {!card.sold && <button onClick={()=>deleteCard(card.id)} style={{background:'#f8717111',border:'1px solid #f8717133',borderRadius:'8px',padding:'0.42rem 0.65rem',color:'#f87171',fontSize:'0.7rem',cursor:'pointer'}}>✕</button>}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab==='agent' && <AgentChat cards={cards} priceCard={priceCard} onClearPrice={()=>setPriceCard(null)}/>}
+
+        {tab==='stats' && (
+          <div style={{flex:1,overflowY:'auto',padding:'1rem'}}>
+            <div style={{display:'flex',gap:'0.75rem',marginBottom:'0.75rem'}}>
+              <Stat label="Active" value={active.length} color="#e8c84a"/>
+              <Stat label="Sold" value={sold.length} color="#4ade80"/>
+            </div>
+            <div style={{display:'flex',gap:'0.75rem',marginBottom:'0.75rem'}}>
+              <Stat label="Invested" value={`$${invested.toFixed(2)}`} color="#60a5fa"/>
+              <Stat label="Realized P&L" value={`${pl>=0?'+':''}$${pl.toFixed(2)}`} color={pl>=0?'#4ade80':'#f87171'}/>
+            </div>
+            {sold.length>0 && (
+              <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:'1px solid #e8c84a22',borderRadius:'14px',padding:'1rem'}}>
+                <div style={{color:'#555',fontSize:'0.68rem',letterSpacing:'1.5px',textTransform:'uppercase',marginBottom:'0.75rem'}}>Sold Cards</div>
+                {sold.map(c=>{
+                  const p=(c.sellPrice-c.buyPrice)*c.quantity;
+                  return <div key={c.id} style={{display:'flex',justifyContent:'space-between',padding:'0.5rem 0',borderBottom:'1px solid #1a1a2e'}}>
+                    <div><div style={{fontSize:'0.85rem',fontWeight:'500'}}>{c.player}{c.rookie?' 🏆':''}</div><div style={{fontSize:'0.7rem',color:'#555'}}>{c.year} {c.set}</div></div>
+                    <div style={{textAlign:'right'}}>
+                      <div style={{color:p>=0?'#4ade80':'#f87171',fontSize:'0.85rem',fontWeight:'600'}}>{p>=0?'+':''}${p.toFixed(2)}</div>
+                      <div style={{color:'#555',fontSize:'0.7rem'}}>${c.buyPrice.toFixed(2)} → ${c.sellPrice?.toFixed(2)}</div>
+                    </div>
+                  </div>;
+                })}
+              </div>
+            )}
+            {cards.length===0 && <div style={{textAlign:'center',padding:'3rem 1rem',color:'#444'}}><div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'1.2rem',letterSpacing:'2px'}}>NO DATA YET</div></div>}
+          </div>
+        )}
+      </div>
+
+      {showForm && <CardForm onAdd={addCard} onClose={()=>{setShowForm(false);setPrefill(null);}} prefill={prefill}/>}
+      {sellCard && <SellModal card={sellCard} onSell={logSale} onClose={()=>setSellCard(null)}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
