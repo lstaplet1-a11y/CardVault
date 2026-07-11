@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black"/>
+<title>Family Calendar</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#fff;font-family:'Inter',sans-serif;max-width:480px;margin:0 auto;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+input,select,textarea,button{font-family:inherit}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:2px}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-8px)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo } = React;
+const KEY = 'family-calendar-v1';
+const ACCENT = '#38bdf8';
+
+async function ai(body) {
+  const r = await fetch('/api/claude', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return d.content?.map(b => b.text||'').join('').trim() || '';
+}
+
+// ---------- date helpers ----------
+const pad = n => String(n).padStart(2,'0');
+const toISO = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const startOfWeek = d => { const x=new Date(d); const day=(x.getDay()+6)%7; x.setDate(x.getDate()-day); x.setHours(0,0,0,0); return x; };
+const addDays = (d,n) => { const x=new Date(d); x.setDate(x.getDate()+n); return x; };
+const fmtTime = d => d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+const fmtDay = d => d.toLocaleDateString([], {weekday:'short', month:'short', day:'numeric'});
+const instKey = e => `${e.uid}|${e.start.toISOString()}`;
+
+// ---------- ICS parsing ----------
+function unescapeICS(s) { return (s||'').replace(/\\n/gi,'\n').replace(/\\,/g,',').replace(/\\;/g,';').replace(/\\\\/g,'\\'); }
+
+function parseICSDate(value, params) {
+  const isDate = params.some(p=>p.toUpperCase()==='VALUE=DATE') || /^\d{8}$/.test(value);
+  if (isDate) {
+    const y=+value.slice(0,4), mo=+value.slice(4,6)-1, d=+value.slice(6,8);
+    return { date: new Date(y,mo,d), allDay:true };
+  }
+  const m = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z)?$/);
+  if (!m) return { date:new Date(value), allDay:false };
+  const [,y,mo,d,h,mi,se,z] = m;
+  const date = z ? new Date(Date.UTC(+y,+mo-1,+d,+h,+mi,+se)) : new Date(+y,+mo-1,+d,+h,+mi,+se);
+  return { date, allDay:false };
+}
+
+function parseICS(text) {
+  const rawLines = text.split(/\r\n|\n|\r/);
+  const lines = [];
+  for (const line of rawLines) {
+    if (/^[ \t]/.test(line) && lines.length) lines[lines.length-1] += line.slice(1);
+    else lines.push(line);
+  }
+  const events = [];
+  let cur = null;
+  for (const line of lines) {
+    if (line.startsWith('BEGIN:VEVENT')) { cur = {}; continue; }
+    if (line.startsWith('END:VEVENT')) { if (cur && cur.start && cur.uid) events.push(cur); cur = null; continue; }
+    if (!cur) continue;
+    const idx = line.indexOf(':');
+    if (idx === -1) continue;
+    const rawKey = line.slice(0, idx);
+    const value = line.slice(idx+1);
+    const params = rawKey.split(';');
+    const key = params[0].toUpperCase();
+    if (key === 'UID') cur.uid = value;
+    else if (key === 'SUMMARY') cur.title = unescapeICS(value);
+    else if (key === 'LOCATION') cur.location = unescapeICS(value);
+    else if (key === 'DESCRIPTION') cur.description = unescapeICS(value);
+    else if (key === 'DTSTART') { const r=parseICSDate(value,params); cur.start=r.date; cur.allDay=r.allDay; }
+    else if (key === 'DTEND') { const r=parseICSDate(value,params); cur.end=r.date; }
+    else if (key === 'RRULE') cur.rrule = value;
+  }
+  return events;
+}
+
+function parseRRule(rrule) {
+  const out = {};
+  rrule.split(';').forEach(p => { const [k,v]=p.split('='); out[k]=v; });
+  return out;
+}
+
+const DAY_OFFSET = {MO:0,TU:1,WE:2,TH:3,FR:4,SA:5,SU:6};
+
+function expandEvent(ev, rangeStart, rangeEnd) {
+  const dur = (ev.end && ev.start) ? (ev.end - ev.start) : 60*60*1000;
+  if (!ev.rrule) {
+    if (ev.start <= rangeEnd && (ev.end||ev.start) >= rangeStart) return [{...ev, end: ev.end || new Date(ev.start.getTime()+dur)}];
+    return [];
+  }
+  const rule = parseRRule(ev.rrule);
+  const freq = rule.FREQ;
+  const interval = parseInt(rule.INTERVAL||'1') || 1;
+  const count = rule.COUNT ? parseInt(rule.COUNT) : Infinity;
+  const until = rule.UNTIL ? parseICSDate(rule.UNTIL, []).date : null;
+  const byday = rule.BYDAY ? rule.BYDAY.split(',') : null;
+  const out = [];
+  let n = 0, iterations = 0;
+  let cursor = new Date(ev.start);
+
+  while (cursor <= rangeEnd && n < count && iterations < 3000) {
+    iterations++;
+    if (until && cursor > until) break;
+    if (freq === 'WEEKLY' && byday) {
+      const weekStart = startOfWeek(cursor);
+      for (const bd of byday) {
+        const off = DAY_OFFSET[bd];
+        if (off === undefined) continue;
+        const occ = addDays(weekStart, off);
+        occ.setHours(ev.start.getHours(), ev.start.getMinutes(), ev.start.getSeconds());
+        if (occ >= ev.start && occ >= rangeStart && occ <= rangeEnd && (!until || occ <= until) && n < count) {
+          out.push({...ev, start: occ, end: new Date(occ.getTime()+dur)});
+          n++;
+        }
+      }
+      cursor = addDays(cursor, 7*interval);
+    } else {
+      if (cursor >= rangeStart) {
+        out.push({...ev, start: new Date(cursor), end: new Date(cursor.getTime()+dur)});
+        n++;
+      }
+      if (freq === 'DAILY') cursor = addDays(cursor, interval);
+      else if (freq === 'WEEKLY') cursor = addDays(cursor, 7*interval);
+      else if (freq === 'MONTHLY') { const x=new Date(cursor); x.setMonth(x.getMonth()+interval); cursor=x; }
+      else break;
+    }
+  }
+  return out;
+}
+
+function getEventsInRange(calendars, rangeStart, rangeEnd) {
+  const out = [];
+  for (const cal of calendars) {
+    for (const ev of (cal.events||[])) {
+      for (const inst of expandEvent(ev, rangeStart, rangeEnd)) {
+        out.push({...inst, calId: cal.id, calName: cal.name, ownerId: cal.ownerId, color: cal.color, kind: cal.kind});
+      }
+    }
+  }
+  return out.sort((a,b)=>a.start-b.start);
+}
+
+function annotateConflicts(events) {
+  const work = events.filter(e=>e.kind==='work');
+  return events.map(e=>{
+    if (e.kind === 'work') return e;
+    const hit = work.find(w => w.start < e.end && w.end > e.start);
+    return hit ? {...e, conflictWith:hit} : e;
+  });
+}
+
+async function fetchIcsUrl(url) {
+  const r = await fetch('/api/ics', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return parseICS(d.text);
+}
+
+// ---------- shared UI bits ----------
+const label = text => <label style={{display:'block',color:'#aaa',fontSize:'0.63rem',letterSpacing:'1.5px',marginBottom:'0.3rem',textTransform:'uppercase'}}>{text}</label>;
+const fieldStyle = {width:'100%',background:'#0d1117',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem 0.9rem',color:'#fff',fontSize:'0.88rem',outline:'none',boxSizing:'border-box'};
+
+function ColorDot({color, size=8}) {
+  return <span style={{display:'inline-block',width:size,height:size,borderRadius:'50%',background:color,flexShrink:0}}/>;
+}
+
+// ---------- Calendars tab ----------
+function CalendarForm({people, onAdd, onClose}) {
+  const [name, setName] = useState('');
+  const [ownerId, setOwnerId] = useState(people[0]?.id||'');
+  const [kind, setKind] = useState('sports');
+  const [sourceType, setSourceType] = useState('url');
+  const [url, setUrl] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const fileRef = useRef(null);
+
+  const kinds = [['sports','Sports / Team'],['school','School'],['work','Work'],['other','Other']];
+
+  const submit = async () => {
+    if (!name.trim()) { setError('Give the calendar a name.'); return; }
+    const owner = people.find(p=>p.id===ownerId);
+    const cal = { id:'cal-'+Date.now(), name:name.trim(), ownerId, kind, color:owner?.color||ACCENT, events:[], lastSynced:null, source:{type:sourceType, url:sourceType==='url'?url.trim():null} };
+    if (sourceType === 'manual') { onAdd(cal); onClose(); return; }
+    if (sourceType === 'url') {
+      if (!url.trim()) { setError('Paste a calendar URL (.ics link).'); return; }
+      setBusy(true); setError('');
+      try { cal.events = await fetchIcsUrl(url.trim()); cal.lastSynced = new Date().toISOString(); onAdd(cal); onClose(); }
+      catch(e) { setError(e.message); }
+      setBusy(false);
+      return;
+    }
+    if (sourceType === 'file') {
+      const file = fileRef.current?.files?.[0];
+      if (!file) { setError('Choose an .ics file to upload.'); return; }
+      setBusy(true); setError('');
+      try {
+        const text = await file.text();
+        cal.events = parseICS(text);
+        cal.lastSynced = new Date().toISOString();
+        onAdd(cal); onClose();
+      } catch(e) { setError('Could not read that file.'); }
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.92)',zIndex:150,display:'flex',alignItems:'flex-start',justifyContent:'center',padding:'1rem',overflowY:'auto'}}>
+      <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${ACCENT}33`,borderRadius:'16px',padding:'1.5rem',width:'100%',maxWidth:'480px',marginBottom:'1rem'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1.25rem'}}>
+          <h2 style={{color:ACCENT,fontFamily:'Bebas Neue,sans-serif',fontSize:'1.6rem',letterSpacing:'2px',margin:0}}>LINK A CALENDAR</h2>
+          <button onClick={onClose} style={{background:'none',border:'none',color:'#666',fontSize:'2rem',cursor:'pointer',lineHeight:1,padding:0}}>&times;</button>
+        </div>
+
+        <div style={{marginBottom:'0.85rem'}}>
+          {label('Name *')}
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Emma's Soccer Team" style={fieldStyle}/>
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.75rem',marginBottom:'0.85rem'}}>
+          <div>
+            {label('Belongs To')}
+            <select value={ownerId} onChange={e=>setOwnerId(e.target.value)} style={fieldStyle}>
+              {people.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div>
+            {label('Type')}
+            <select value={kind} onChange={e=>setKind(e.target.value)} style={fieldStyle}>
+              {kinds.map(([v,l])=><option key={v} value={v}>{l}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div style={{marginBottom:'0.85rem'}}>
+          {label('Source')}
+          <div style={{display:'flex',gap:'0.5rem'}}>
+            {[['url','ICS Link'],['file','Upload .ics'],['manual','Manual']].map(([v,l])=>(
+              <button key={v} onClick={()=>setSourceType(v)} style={{flex:1,background:sourceType===v?ACCENT:'#0d1117',border:`1px solid ${sourceType===v?ACCENT:'#2a2a4a'}`,borderRadius:'8px',padding:'0.5rem',color:sourceType===v?'#0d1117':'#888',fontSize:'0.72rem',letterSpacing:'0.5px',cursor:'pointer',fontWeight:600}}>{l}</button>
+            ))}
+          </div>
+        </div>
+
+        {sourceType==='url' && (
+          <div style={{marginBottom:'0.85rem'}}>
+            {label('Calendar (.ics) URL')}
+            <input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://.../calendar.ics" style={fieldStyle}/>
+            <div style={{fontSize:'0.7rem',color:'#555',marginTop:'0.4rem',lineHeight:1.4}}>Works with public/secret .ics feed links from Google Calendar, Outlook, TeamSnap, SportsEngine, GameChanger, etc.</div>
+          </div>
+        )}
+        {sourceType==='file' && (
+          <div style={{marginBottom:'0.85rem'}}>
+            {label('Upload .ics File')}
+            <input ref={fileRef} type="file" accept=".ics,text/calendar" style={{...fieldStyle,padding:'0.5rem'}}/>
+          </div>
+        )}
+        {sourceType==='manual' && (
+          <div style={{fontSize:'0.78rem',color:'#888',marginBottom:'0.85rem',lineHeight:1.5}}>You'll add events by hand from the Calendars tab after creating this calendar.</div>
+        )}
+
+        {error && <div style={{background:'#f8717111',border:'1px solid #f8717133',borderRadius:'8px',padding:'0.6rem 0.85rem',color:'#f87171',fontSize:'0.78rem',marginBottom:'0.85rem'}}>{error}</div>}
+
+        <button onClick={submit} disabled={busy} style={{width:'100%',background:busy?'#2a2a4a':`linear-gradient(135deg,${ACCENT},#0284c7)`,border:'none',borderRadius:'10px',padding:'0.9rem',color:busy?'#888':'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.1rem',letterSpacing:'2px',cursor:busy?'default':'pointer'}}>
+          {busy ? 'SYNCING...' : 'ADD CALENDAR'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ManualEventForm({cal, onAdd, onClose}) {
+  const [title, setTitle] = useState('');
+  const [date, setDate] = useState(toISO(new Date()));
+  const [start, setStart] = useState('16:00');
+  const [end, setEnd] = useState('17:00');
+  const [loc, setLoc] = useState('');
+
+  const submit = () => {
+    if (!title.trim()) return;
+    const s = new Date(`${date}T${start}:00`);
+    const e = new Date(`${date}T${end}:00`);
+    onAdd({ uid:'manual-'+Date.now()+'-'+Math.random().toString(36).slice(2), title:title.trim(), start:s, end:e, allDay:false, location:loc.trim() });
+    onClose();
+  };
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.92)',zIndex:160,display:'flex',alignItems:'center',justifyContent:'center',padding:'1rem'}}>
+      <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${cal.color}55`,borderRadius:'16px',padding:'1.5rem',width:'100%',maxWidth:'420px'}}>
+        <h2 style={{color:cal.color,fontFamily:'Bebas Neue,sans-serif',fontSize:'1.4rem',letterSpacing:'2px',margin:'0 0 1rem'}}>ADD EVENT — {cal.name.toUpperCase()}</h2>
+        <div style={{marginBottom:'0.75rem'}}>{label('Title *')}<input value={title} onChange={e=>setTitle(e.target.value)} placeholder="Practice, game, pickup..." style={fieldStyle}/></div>
+        <div style={{marginBottom:'0.75rem'}}>{label('Date')}<input type="date" value={date} onChange={e=>setDate(e.target.value)} style={fieldStyle}/></div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.75rem',marginBottom:'0.75rem'}}>
+          <div>{label('Start')}<input type="time" value={start} onChange={e=>setStart(e.target.value)} style={fieldStyle}/></div>
+          <div>{label('End')}<input type="time" value={end} onChange={e=>setEnd(e.target.value)} style={fieldStyle}/></div>
+        </div>
+        <div style={{marginBottom:'1.25rem'}}>{label('Location')}<input value={loc} onChange={e=>setLoc(e.target.value)} placeholder="Field, address..." style={fieldStyle}/></div>
+        <div style={{display:'flex',gap:'0.75rem'}}>
+          <button onClick={onClose} style={{flex:1,background:'transparent',border:'1px solid #333',borderRadius:'8px',padding:'0.75rem',color:'#aaa',cursor:'pointer'}}>Cancel</button>
+          <button onClick={submit} style={{flex:2,background:`linear-gradient(135deg,${cal.color},#0284c7)`,border:'none',borderRadius:'8px',padding:'0.75rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'1rem',letterSpacing:'2px',cursor:'pointer'}}>ADD EVENT</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CalendarsTab({people, calendars, onAdd, onDelete, onResync, onAddEvent, syncing}) {
+  const [showForm, setShowForm] = useState(false);
+  const [evCal, setEvCal] = useState(null);
+  const ownerName = id => people.find(p=>p.id===id)?.name || '—';
+
+  return (
+    <div style={{flex:1,overflowY:'auto',padding:'1rem'}}>
+      <button onClick={()=>setShowForm(true)} style={{width:'100%',background:`linear-gradient(135deg,${ACCENT},#0284c7)`,border:'none',borderRadius:'10px',padding:'0.75rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'1rem',letterSpacing:'2px',cursor:'pointer',marginBottom:'1rem'}}>+ LINK CALENDAR</button>
+
+      {calendars.length===0 ? (
+        <div style={{textAlign:'center',padding:'3rem 1rem',color:'#444'}}>
+          <div style={{fontSize:'3rem',marginBottom:'1rem'}}>📅</div>
+          <div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'1.2rem',letterSpacing:'2px'}}>NO CALENDARS YET</div>
+          <div style={{fontSize:'0.82rem',marginTop:'0.5rem'}}>Link a work calendar or a kid's sports team to get started.</div>
+        </div>
+      ) : (
+        <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
+          {calendars.map(cal => (
+            <div key={cal.id} style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${cal.color}33`,borderRadius:'14px',padding:'0.9rem'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',minWidth:0}}>
+                  <ColorDot color={cal.color} size={11}/>
+                  <div style={{fontWeight:600,fontSize:'0.95rem',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{cal.name}</div>
+                </div>
+                <button onClick={()=>onDelete(cal.id)} style={{background:'#f8717111',border:'1px solid #f8717133',borderRadius:'6px',padding:'0.25rem 0.5rem',color:'#f87171',fontSize:'0.7rem',cursor:'pointer',flexShrink:0}}>✕</button>
+              </div>
+              <div style={{color:'#666',fontSize:'0.75rem',marginTop:'0.3rem'}}>{ownerName(cal.ownerId)} · {cal.kind} · {(cal.events||[]).length} events</div>
+              <div style={{color:'#555',fontSize:'0.68rem',marginTop:'0.15rem'}}>{cal.source.type==='url' ? `Synced ${cal.lastSynced ? new Date(cal.lastSynced).toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : 'never'}` : cal.source.type==='file' ? 'Uploaded file' : 'Manual entries'}</div>
+              <div style={{display:'flex',gap:'0.5rem',marginTop:'0.7rem'}}>
+                {cal.source.type==='url' && <button onClick={()=>onResync(cal.id)} disabled={syncing===cal.id} style={{flex:1,background:`${ACCENT}11`,border:`1px solid ${ACCENT}33`,borderRadius:'8px',padding:'0.42rem',color:ACCENT,fontSize:'0.7rem',letterSpacing:'1px',cursor:'pointer',fontWeight:600,textTransform:'uppercase'}}>{syncing===cal.id?'Syncing…':'↻ Resync'}</button>}
+                {cal.source.type==='manual' && <button onClick={()=>setEvCal(cal)} style={{flex:1,background:`${ACCENT}11`,border:`1px solid ${ACCENT}33`,borderRadius:'8px',padding:'0.42rem',color:ACCENT,fontSize:'0.7rem',letterSpacing:'1px',cursor:'pointer',fontWeight:600,textTransform:'uppercase'}}>+ Add Event</button>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showForm && <CalendarForm people={people} onAdd={onAdd} onClose={()=>setShowForm(false)}/>}
+      {evCal && <ManualEventForm cal={evCal} onAdd={ev=>onAddEvent(evCal.id, ev)} onClose={()=>setEvCal(null)}/>}
+    </div>
+  );
+}
+
+// ---------- People tab ----------
+function PeopleTab({people, onAdd, onUpdate, onDelete}) {
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const palette = ['#38bdf8','#4ade80','#c084fc','#f97316','#f472b6','#facc15'];
+
+  return (
+    <div style={{flex:1,overflowY:'auto',padding:'1rem'}}>
+      <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginBottom:'1.25rem'}}>
+        {people.map(p => (
+          <div key={p.id} style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${p.color}33`,borderRadius:'14px',padding:'0.9rem'}}>
+            <div style={{display:'flex',alignItems:'center',gap:'0.6rem',marginBottom:'0.6rem'}}>
+              <ColorDot color={p.color} size={12}/>
+              <input value={p.name} onChange={e=>onUpdate(p.id,{name:e.target.value})} style={{...fieldStyle,flex:1,padding:'0.4rem 0.7rem'}}/>
+              <button onClick={()=>onDelete(p.id)} style={{background:'#f8717111',border:'1px solid #f8717133',borderRadius:'6px',padding:'0.3rem 0.55rem',color:'#f87171',fontSize:'0.7rem',cursor:'pointer'}}>✕</button>
+            </div>
+            <input value={p.phone||''} onChange={e=>onUpdate(p.id,{phone:e.target.value})} placeholder="Phone (for texting, optional)" style={{...fieldStyle,padding:'0.4rem 0.7rem',fontSize:'0.8rem'}}/>
+            <div style={{display:'flex',gap:'0.4rem',marginTop:'0.6rem'}}>
+              {palette.map(c=><button key={c} onClick={()=>onUpdate(p.id,{color:c})} style={{width:'22px',height:'22px',borderRadius:'50%',background:c,border:p.color===c?'2px solid #fff':'2px solid transparent',cursor:'pointer'}}/>)}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:'1px solid #2a2a4a',borderRadius:'14px',padding:'0.9rem'}}>
+        <div style={{color:'#555',fontSize:'0.68rem',letterSpacing:'1.5px',textTransform:'uppercase',marginBottom:'0.6rem'}}>Add Person</div>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="Name" style={{...fieldStyle,marginBottom:'0.5rem'}}/>
+        <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="Phone (optional)" style={{...fieldStyle,marginBottom:'0.75rem'}}/>
+        <button onClick={()=>{ if(!name.trim()) return; onAdd({id:'p-'+Date.now(), name:name.trim(), phone:phone.trim(), color:palette[Math.floor(Math.random()*palette.length)]}); setName(''); setPhone(''); }}
+          style={{width:'100%',background:`linear-gradient(135deg,${ACCENT},#0284c7)`,border:'none',borderRadius:'8px',padding:'0.6rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.95rem',letterSpacing:'1.5px',cursor:'pointer'}}>+ ADD PERSON</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Week tab ----------
+function EventRow({ev, people, assignment, onAssign}) {
+  const showAssign = ev.kind !== 'work';
+  const a = assignment || {};
+  return (
+    <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:`1px solid ${ev.color}33`,borderRadius:'12px',padding:'0.75rem 0.85rem',marginBottom:'0.6rem'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'0.5rem'}}>
+        <div style={{minWidth:0,flex:1}}>
+          <div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
+            <ColorDot color={ev.color}/>
+            <div style={{fontWeight:600,fontSize:'0.88rem',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{ev.title}</div>
+          </div>
+          <div style={{color:'#888',fontSize:'0.74rem',marginTop:'0.2rem'}}>{ev.allDay ? 'All day' : `${fmtTime(ev.start)} – ${fmtTime(ev.end)}`} · {ev.calName}</div>
+          {ev.location && <div style={{color:'#555',fontSize:'0.7rem',marginTop:'0.1rem'}}>📍 {ev.location}</div>}
+          {ev.conflictWith && <div style={{color:'#fbbf24',fontSize:'0.68rem',marginTop:'0.3rem'}}>⚠ overlaps with {ev.conflictWith.calName}</div>}
+        </div>
+      </div>
+      {showAssign && (
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.5rem',marginTop:'0.6rem'}}>
+          <div>
+            <div style={{color:'#555',fontSize:'0.6rem',letterSpacing:'1px',textTransform:'uppercase',marginBottom:'0.2rem'}}>Drop-off</div>
+            <select value={a.dropoff||''} onChange={e=>onAssign({...a,dropoff:e.target.value})} style={{...fieldStyle,padding:'0.35rem 0.5rem',fontSize:'0.76rem'}}>
+              <option value="">Unassigned</option>
+              {people.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{color:'#555',fontSize:'0.6rem',letterSpacing:'1px',textTransform:'uppercase',marginBottom:'0.2rem'}}>Pickup</div>
+            <select value={a.pickup||''} onChange={e=>onAssign({...a,pickup:e.target.value})} style={{...fieldStyle,padding:'0.35rem 0.5rem',fontSize:'0.76rem'}}>
+              <option value="">Unassigned</option>
+              {people.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WeekTab({calendars, people, assignments, setAssignment, onOpenDraft}) {
+  const [weekStart, setWeekStart] = useState(()=>startOfWeek(new Date()));
+  const weekEnd = addDays(weekStart, 7);
+  const events = useMemo(()=>annotateConflicts(getEventsInRange(calendars, weekStart, weekEnd)), [calendars, weekStart]);
+  const days = [...Array(7)].map((_,i)=>addDays(weekStart,i));
+  const today = toISO(new Date());
+
+  return (
+    <div style={{flex:1,overflowY:'auto',padding:'1rem'}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'1rem'}}>
+        <button onClick={()=>setWeekStart(addDays(weekStart,-7))} style={{background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.4rem 0.7rem',color:'#aaa',cursor:'pointer'}}>‹</button>
+        <div style={{textAlign:'center'}}>
+          <div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'1rem',letterSpacing:'1px',color:ACCENT}}>{fmtDay(weekStart)} – {fmtDay(addDays(weekStart,6))}</div>
+          <button onClick={()=>setWeekStart(startOfWeek(new Date()))} style={{background:'none',border:'none',color:'#555',fontSize:'0.68rem',cursor:'pointer',textDecoration:'underline',marginTop:'0.1rem'}}>Today</button>
+        </div>
+        <button onClick={()=>setWeekStart(addDays(weekStart,7))} style={{background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.4rem 0.7rem',color:'#aaa',cursor:'pointer'}}>›</button>
+      </div>
+
+      <button onClick={onOpenDraft} style={{width:'100%',background:`linear-gradient(135deg,#4ade80,#22c55e)`,border:'none',borderRadius:'10px',padding:'0.7rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.95rem',letterSpacing:'1.5px',cursor:'pointer',marginBottom:'1.25rem'}}>✉️ DRAFT WEEKLY TEXT</button>
+
+      {calendars.length===0 && (
+        <div style={{textAlign:'center',padding:'2rem 1rem',color:'#444'}}>
+          <div style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'1.1rem',letterSpacing:'2px'}}>NO CALENDARS LINKED</div>
+          <div style={{fontSize:'0.8rem',marginTop:'0.4rem'}}>Head to the Calendars tab to link a work or sports calendar.</div>
+        </div>
+      )}
+
+      {days.map(day => {
+        const iso = toISO(day);
+        const dayEvents = events.filter(e=>toISO(e.start)===iso);
+        return (
+          <div key={iso} style={{marginBottom:'1.1rem'}}>
+            <div style={{color:iso===today?ACCENT:'#666',fontSize:'0.72rem',letterSpacing:'1.5px',textTransform:'uppercase',marginBottom:'0.5rem',fontWeight:600}}>{fmtDay(day)}{iso===today?' · Today':''}</div>
+            {dayEvents.length===0 ? (
+              <div style={{color:'#333',fontSize:'0.78rem',padding:'0.4rem 0.1rem'}}>No events</div>
+            ) : dayEvents.map(ev => (
+              <EventRow key={instKey(ev)} ev={ev} people={people} assignment={assignments[instKey(ev)]} onAssign={patch=>setAssignment(instKey(ev),patch)}/>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- Draft text modal ----------
+function DraftModal({calendars, people, assignments, onClose}) {
+  const weekStart = startOfWeek(new Date());
+  const [recipientId, setRecipientId] = useState(()=> people.find(p=>/nick/i.test(p.name))?.id || people[1]?.id || people[0]?.id);
+  const [draft, setDraft] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const buildSummary = () => {
+    const events = annotateConflicts(getEventsInRange(calendars, weekStart, addDays(weekStart,7))).filter(e=>e.kind!=='work');
+    if (events.length===0) return 'No kid events scheduled this week.';
+    const byDay = {};
+    events.forEach(e => { (byDay[toISO(e.start)] = byDay[toISO(e.start)]||[]).push(e); });
+    let text = '';
+    Object.keys(byDay).sort().forEach(k => {
+      text += `${fmtDay(new Date(k+'T00:00:00'))}:\n`;
+      byDay[k].forEach(e => {
+        const a = assignments[instKey(e)] || {};
+        const drop = a.dropoff ? (people.find(p=>p.id===a.dropoff)?.name || 'unassigned') : 'unassigned';
+        const pick = a.pickup ? (people.find(p=>p.id===a.pickup)?.name || 'unassigned') : 'unassigned';
+        text += `- ${e.allDay ? 'All day' : fmtTime(e.start)} ${e.title}${e.location ? ' @ '+e.location : ''} (${e.calName}) — drop-off: ${drop}, pickup: ${pick})${e.conflictWith ? ' [possible conflict with '+e.conflictWith.calName+']' : ''}\n`;
+      });
+    });
+    return text;
+  };
+
+  const generate = async () => {
+    setLoading(true); setError('');
+    const summary = buildSummary();
+    const recipient = people.find(p=>p.id===recipientId);
+    try {
+      const text = await ai({
+        model:'claude-sonnet-4-5', max_tokens:600,
+        system:'You write short, warm, casual text messages between co-parents/family coordinating kids\' schedules. Keep it brief and easy to scan on a phone. Confirm plans that are already assigned, and clearly call out anything unassigned that needs a decision. No corporate tone, no long paragraphs, no subject line. Sign off casually.',
+        messages:[{role:'user', content:`Write a text message to ${recipient?.name||'them'} summarizing this week's kid schedule and confirming drop-off/pickup, based on this data:\n\n${summary}`}]
+      });
+      setDraft(text);
+    } catch(e) { setError(e.message); setDraft(summary); }
+    setLoading(false);
+  };
+
+  useEffect(()=>{ generate(); }, [recipientId]);
+
+  const recipient = people.find(p=>p.id===recipientId);
+  const copy = () => navigator.clipboard?.writeText(draft);
+  const smsHref = `sms:${recipient?.phone||''}?&body=${encodeURIComponent(draft)}`;
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.92)',zIndex:150,display:'flex',alignItems:'flex-start',justifyContent:'center',padding:'1rem',overflowY:'auto'}}>
+      <div style={{background:'linear-gradient(145deg,#1a1a2e,#16213e)',border:'1px solid #4ade8033',borderRadius:'16px',padding:'1.5rem',width:'100%',maxWidth:'480px',marginBottom:'1rem'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'1rem'}}>
+          <h2 style={{color:'#4ade80',fontFamily:'Bebas Neue,sans-serif',fontSize:'1.5rem',letterSpacing:'2px',margin:0}}>WEEKLY TEXT</h2>
+          <button onClick={onClose} style={{background:'none',border:'none',color:'#666',fontSize:'2rem',cursor:'pointer',lineHeight:1,padding:0}}>&times;</button>
+        </div>
+
+        <div style={{marginBottom:'0.85rem'}}>
+          {label('Send To')}
+          <select value={recipientId} onChange={e=>setRecipientId(e.target.value)} style={fieldStyle}>
+            {people.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+
+        {loading ? (
+          <div style={{display:'flex',gap:'0.4rem',padding:'2rem 0',justifyContent:'center'}}>
+            {[0,1,2].map(i=><div key={i} style={{width:'8px',height:'8px',borderRadius:'50%',background:'#4ade80',animation:`bounce 1.2s ease-in-out ${i*0.2}s infinite`}}/>)}
+          </div>
+        ) : (
+          <textarea value={draft} onChange={e=>setDraft(e.target.value)} rows={10} style={{...fieldStyle,resize:'vertical',lineHeight:1.5,marginBottom:'0.75rem'}}/>
+        )}
+        {error && <div style={{color:'#fbbf24',fontSize:'0.72rem',marginBottom:'0.75rem'}}>Couldn't reach the AI drafting service, showing the raw schedule instead. ({error})</div>}
+
+        <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.5rem'}}>
+          <button onClick={generate} disabled={loading} style={{flex:1,background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem',color:'#aaa',fontSize:'0.78rem',cursor:'pointer'}}>↻ Regenerate</button>
+          <button onClick={copy} style={{flex:1,background:'#1a1a2e',border:'1px solid #2a2a4a',borderRadius:'8px',padding:'0.6rem',color:'#aaa',fontSize:'0.78rem',cursor:'pointer'}}>📋 Copy</button>
+        </div>
+        <a href={smsHref} style={{display:'block',textAlign:'center',width:'100%',background:'linear-gradient(135deg,#4ade80,#22c55e)',border:'none',borderRadius:'10px',padding:'0.8rem',color:'#0d1117',fontFamily:'Bebas Neue,sans-serif',fontSize:'1rem',letterSpacing:'2px',textDecoration:'none',boxSizing:'border-box'}}>💬 TEXT {recipient?.name?.toUpperCase()||''}</a>
+      </div>
+    </div>
+  );
+}
+
+// ---------- App ----------
+function App() {
+  const [state, setState] = useState(()=>{
+    try {
+      const saved = JSON.parse(localStorage.getItem(KEY));
+      if (saved) return saved;
+    } catch {}
+    return {
+      people: [
+        {id:'me', name:'Me', color:'#38bdf8', phone:''},
+        {id:'nick', name:'Nick', color:'#4ade80', phone:''},
+        {id:'rachel', name:'Rachel', color:'#c084fc', phone:''}
+      ],
+      calendars: [],
+      assignments: {}
+    };
+  });
+  const [tab, setTab] = useState('week');
+  const [showDraft, setShowDraft] = useState(false);
+  const [syncing, setSyncing] = useState(null);
+
+  useEffect(()=>{ try{localStorage.setItem(KEY, JSON.stringify(state));}catch{} }, [state]);
+
+  // revive Date objects on load since JSON.stringify serialized them to strings
+  const calendars = useMemo(()=> state.calendars.map(c => ({
+    ...c,
+    events: (c.events||[]).map(e => ({...e, start:new Date(e.start), end: e.end?new Date(e.end):undefined}))
+  })), [state.calendars]);
+
+  const addCalendar = cal => setState(s => ({...s, calendars:[...s.calendars, cal]}));
+  const deleteCalendar = id => setState(s => ({...s, calendars:s.calendars.filter(c=>c.id!==id)}));
+  const addEventToCalendar = (calId, ev) => setState(s => ({...s, calendars:s.calendars.map(c=>c.id===calId?{...c,events:[...(c.events||[]),ev]}:c)}));
+  const resyncCalendar = async (id) => {
+    const cal = state.calendars.find(c=>c.id===id);
+    if (!cal?.source?.url) return;
+    setSyncing(id);
+    try {
+      const events = await fetchIcsUrl(cal.source.url);
+      setState(s => ({...s, calendars:s.calendars.map(c=>c.id===id?{...c,events,lastSynced:new Date().toISOString()}:c)}));
+    } catch(e) { alert('Sync failed: '+e.message); }
+    setSyncing(null);
+  };
+
+  const addPerson = p => setState(s=>({...s, people:[...s.people, p]}));
+  const updatePerson = (id, patch) => setState(s=>({...s, people:s.people.map(p=>p.id===id?{...p,...patch}:p)}));
+  const deletePerson = id => setState(s=>({...s, people:s.people.filter(p=>p.id!==id)}));
+  const setAssignment = (key, patch) => setState(s=>({...s, assignments:{...s.assignments, [key]:{...s.assignments[key], ...patch}}}));
+
+  const tabBtn = (id,lbl) => (
+    <button onClick={()=>setTab(id)} style={{flex:1,background:'none',border:'none',borderBottom:`2px solid ${tab===id?ACCENT:'transparent'}`,color:tab===id?ACCENT:'#555',fontFamily:'Bebas Neue,sans-serif',fontSize:'0.83rem',letterSpacing:'1.5px',padding:'0.6rem 0',cursor:'pointer'}}>{lbl}</button>
+  );
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100vh',background:'#0d1117'}}>
+      <div style={{background:'linear-gradient(135deg,#1a1a2e,#16213e)',borderBottom:`1px solid ${ACCENT}22`,padding:'1.25rem 1rem 0',flexShrink:0}}>
+        <div style={{marginBottom:'1rem'}}>
+          <h1 style={{fontFamily:'Bebas Neue,sans-serif',fontSize:'2rem',letterSpacing:'3px',color:ACCENT,margin:0,lineHeight:1}}>FAMILY CALENDAR</h1>
+          <p style={{color:'#444',fontSize:'0.68rem',margin:'0.2rem 0 0',letterSpacing:'1px'}}>KIDS · WORK · SPORTS, ALL IN ONE PLACE</p>
+        </div>
+        <div style={{display:'flex'}}>{tabBtn('week','THIS WEEK')}{tabBtn('calendars','CALENDARS')}{tabBtn('people','PEOPLE')}</div>
+      </div>
+
+      <div style={{flex:1,overflow:'hidden',display:'flex',flexDirection:'column'}}>
+        {tab==='week' && <WeekTab calendars={calendars} people={state.people} assignments={state.assignments} setAssignment={setAssignment} onOpenDraft={()=>setShowDraft(true)}/>}
+        {tab==='calendars' && <CalendarsTab people={state.people} calendars={calendars} onAdd={addCalendar} onDelete={deleteCalendar} onResync={resyncCalendar} onAddEvent={addEventToCalendar} syncing={syncing}/>}
+        {tab==='people' && <PeopleTab people={state.people} onAdd={addPerson} onUpdate={updatePerson} onDelete={deletePerson}/>}
+      </div>
+
+      {showDraft && <DraftModal calendars={calendars} people={state.people} assignments={state.assignments} onClose={()=>setShowDraft(false)}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
